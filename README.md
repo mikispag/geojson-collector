@@ -291,6 +291,19 @@ sudo systemctl status geojson-collector
 sudo journalctl -u geojson-collector -f
 ```
 
+## 🔒 Reverse Proxy & HTTPS (Caddy)
+
+`geojson-collector` runs as a plain HTTP daemon and is designed to sit behind a reverse proxy (such as Caddy or Nginx) to handle TLS/HTTPS termination, certificate lifecycle (ACME/Let's Encrypt), and public exposure.
+
+### Caddyfile Snippet
+
+```caddy
+# Subdomain configuration
+location.example.com {
+    reverse_proxy 127.0.0.1:9696
+}
+```
+
 ---
 
 ## 📡 API Reference
