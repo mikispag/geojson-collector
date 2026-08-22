@@ -1,0 +1,29 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/geojson-collector
+
+
+# SQLite test & data files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Test artifacts
+*.out
+*.test
+/var/lib/geojson-collector/
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

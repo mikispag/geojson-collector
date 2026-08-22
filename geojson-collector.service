@@ -1,0 +1,24 @@
+[Unit]
+Description=GeoJSON Collector Daemon for iOS Overland
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=geojson-collector
+Group=geojson-collector
+ExecStart=/usr/local/bin/geojson-collector serve --config /etc/geojson-collector/config.json
+Restart=always
+RestartSec=5s
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/geojson-collector
+ReadOnlyPaths=/etc/geojson-collector
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

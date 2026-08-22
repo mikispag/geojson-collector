@@ -1,0 +1,8 @@
+{
+  "host": "0.0.0.0",
+  "port": 9696,
+  "auth_token": "replace_with_a_secure_random_token",
+  "data_dir": "/var/lib/geojson-collector",
+  "dedup_radius_meters": 1.0,
+  "dedup_interval_seconds": 60.0
+}
