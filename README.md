@@ -267,26 +267,39 @@ PRAGMA temp_store = MEMORY;
 
 ## 🐧 Systemd Service Setup
 
-A sample systemd service file is provided in [`geojson-collector.service`](geojson-collector.service).
+`geojson-collector` uses `systemd-sysusers` for declarative system user provisioning and `systemd`'s `StateDirectory` / `ConfigurationDirectory` directives to automatically manage `/var/lib/geojson-collector` and `/etc/geojson-collector` ownership and permissions.
+
+### 1. Declarative System User (`systemd-sysusers`)
+
+Deploy [`geojson-collector.sysusers`](geojson-collector.sysusers) to create the dedicated system user and group:
 
 ```bash
-# 1. Create dedicated user and directory
-sudo useradd -r -s /usr/bin/nologin geojson-collector
-sudo mkdir -p /var/lib/geojson-collector /etc/geojson-collector
-sudo chown -R geojson-collector:geojson-collector /var/lib/geojson-collector /etc/geojson-collector
+# On Arch Linux and Debian/Ubuntu:
+sudo cp geojson-collector.sysusers /etc/sysusers.d/geojson-collector.conf
+sudo systemd-sysusers
+```
 
-# 2. Copy configuration
-sudo cp config.example.json /etc/geojson-collector/config.json
-sudo chmod 600 /etc/geojson-collector/config.json
-sudo chown geojson-collector:geojson-collector /etc/geojson-collector/config.json
+### 2. Configuration & Binary Installation
 
-# 3. Install binary & service
-sudo cp geojson-collector /usr/local/bin/
+```bash
+# Install binary
+sudo install -m 755 geojson-collector /usr/local/bin/
+
+# Install configuration (owned by geojson-collector)
+sudo mkdir -p /etc/geojson-collector
+sudo install -m 600 -o geojson-collector -g geojson-collector config.example.json /etc/geojson-collector/config.json
+
+# Install and start systemd service
 sudo cp geojson-collector.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now geojson-collector
+```
 
-# 4. Check status & logs
+`/var/lib/geojson-collector` is provisioned automatically with `0750` permissions by `systemd` via `StateDirectory=geojson-collector` when the service starts.
+
+### 3. Check Status & Logs
+
+```bash
 sudo systemctl status geojson-collector
 sudo journalctl -u geojson-collector -f
 ```

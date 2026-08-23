@@ -11,11 +11,15 @@ ExecStart=/usr/local/bin/geojson-collector serve --config /etc/geojson-collector
 Restart=always
 RestartSec=5s
 
+# Directory Management
+StateDirectory=geojson-collector
+StateDirectoryMode=0750
+ConfigurationDirectory=geojson-collector
+ConfigurationDirectoryMode=0750
+
 # Hardening
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/geojson-collector
-ReadOnlyPaths=/etc/geojson-collector
 PrivateTmp=true
 NoNewPrivileges=true
 CapabilityBoundingSet=
