@@ -15,7 +15,6 @@ RestartSec=5s
 StateDirectory=geojson-collector
 StateDirectoryMode=0750
 ConfigurationDirectory=geojson-collector
-ConfigurationDirectoryMode=0750
 
 # Hardening
 ProtectSystem=strict
