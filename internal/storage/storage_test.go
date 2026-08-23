@@ -172,8 +172,8 @@ func TestStorageManager_ReadOnlyQuery(t *testing.T) {
 		t.Fatalf("failed to close: %v", err)
 	}
 
-	// Create a new manager instance and perform a read-only query
-	readMgr, err := storage.NewManager(tempDir)
+	// Create a read-only manager instance and perform a read-only query
+	readMgr, err := storage.NewReadOnlyManager(tempDir)
 	if err != nil {
 		t.Fatalf("failed to init read manager: %v", err)
 	}
@@ -185,5 +185,43 @@ func TestStorageManager_ReadOnlyQuery(t *testing.T) {
 	}
 	if len(recs) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(recs))
+	}
+
+	// Verify that inserting into read-only manager returns error
+	if err := readMgr.InsertLocation(ctx, rec); err == nil {
+		t.Fatal("expected error when inserting into read-only manager, got nil")
+	}
+}
+
+func TestStorageManager_QueryThenInsertInReadWriteManager(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr, err := storage.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	t0 := time.Now().UTC()
+
+	// 1. First run a window query (like deduplication does on first incoming point)
+	recs, err := mgr.GetLocationsInWindow(ctx, t0.Add(-time.Minute), t0.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("GetLocationsInWindow failed: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Fatalf("expected 0 records initially, got %d", len(recs))
+	}
+
+	// 2. Then insert location into the same day (must succeed without 'attempt to write a readonly database')
+	rec := &models.LocationRecord{
+		Timestamp:    t0,
+		TimestampISO: t0.Format(time.RFC3339),
+		Latitude:     47.3769,
+		Longitude:    8.5417,
+	}
+
+	if err := mgr.InsertLocation(ctx, rec); err != nil {
+		t.Fatalf("InsertLocation failed after window query: %v", err)
 	}
 }

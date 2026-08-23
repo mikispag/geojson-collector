@@ -54,12 +54,13 @@ const (
 // Manager coordinates opening, closing, querying, and inserting into daily SQLite databases.
 type Manager struct {
 	dataDir    string
+	readOnly   bool
 	mu         sync.RWMutex
 	dbs        map[string]*sql.DB
 	lastAccess map[string]time.Time
 }
 
-// NewManager creates a new storage Manager for the given data directory.
+// NewManager creates a new read-write storage Manager for the given data directory (used by daemon).
 func NewManager(dataDir string) (*Manager, error) {
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -68,14 +69,25 @@ func NewManager(dataDir string) (*Manager, error) {
 	}
 	return &Manager{
 		dataDir:    dataDir,
+		readOnly:   false,
+		dbs:        make(map[string]*sql.DB),
+		lastAccess: make(map[string]time.Time),
+	}, nil
+}
+
+// NewReadOnlyManager creates a read-only storage Manager for the given data directory (used by exporter).
+func NewReadOnlyManager(dataDir string) (*Manager, error) {
+	return &Manager{
+		dataDir:    dataDir,
+		readOnly:   true,
 		dbs:        make(map[string]*sql.DB),
 		lastAccess: make(map[string]time.Time),
 	}, nil
 }
 
 // getDBForDate returns or opens the SQLite database for a specific UTC date (YYYY-MM-DD).
-// If readOnly is true, it opens the database in read-only mode without executing WAL pragma or DDL.
-func (m *Manager) getDBForDate(dateStr string, readOnly bool) (*sql.DB, error) {
+// In read-only mode, it opens with mode=ro without executing WAL pragma or DDL.
+func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -106,7 +118,7 @@ func (m *Manager) getDBForDate(dateStr string, readOnly bool) (*sql.DB, error) {
 
 	dbPath := filepath.Join(m.dataDir, fmt.Sprintf("%s.sqlite", dateStr))
 
-	if readOnly {
+	if m.readOnly {
 		dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)", dbPath)
 		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
@@ -152,9 +164,12 @@ func (m *Manager) InsertLocation(ctx context.Context, loc *models.LocationRecord
 	if loc == nil {
 		return fmt.Errorf("nil location record")
 	}
+	if m.readOnly {
+		return fmt.Errorf("cannot insert location into read-only manager")
+	}
 
 	dateStr := loc.Timestamp.UTC().Format("2006-01-02")
-	db, err := m.getDBForDate(dateStr, false)
+	db, err := m.getDBForDate(dateStr)
 	if err != nil {
 		return err
 	}
@@ -257,7 +272,7 @@ func (m *Manager) GetLocationsInWindow(ctx context.Context, start, end time.Time
 			}
 		}
 
-		db, err := m.getDBForDate(dateStr, true)
+		db, err := m.getDBForDate(dateStr)
 		if err != nil {
 			return nil, err
 		}

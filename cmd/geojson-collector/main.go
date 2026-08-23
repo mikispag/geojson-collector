@@ -254,7 +254,7 @@ func runExport(args []string) error {
 		}
 	}
 
-	mgr, err := storage.NewManager(dataDir)
+	mgr, err := storage.NewReadOnlyManager(dataDir)
 	if err != nil {
 		return fmt.Errorf("initializing storage manager: %w", err)
 	}
