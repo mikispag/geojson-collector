@@ -275,7 +275,7 @@ Deploy [`geojson-collector.sysusers`](geojson-collector.sysusers) to create the 
 
 ```bash
 # On Arch Linux and Debian/Ubuntu:
-sudo cp geojson-collector.sysusers /etc/sysusers.d/geojson-collector.conf
+sudo cp geojson-collector.sysusers /usr/lib/sysusers.d/geojson-collector.conf
 sudo systemd-sysusers
 ```
 
