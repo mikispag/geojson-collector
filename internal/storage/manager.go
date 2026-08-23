@@ -47,11 +47,16 @@ CREATE INDEX IF NOT EXISTS idx_locations_ts ON locations(timestamp);
 CREATE INDEX IF NOT EXISTS idx_locations_coords ON locations(latitude, longitude);
 `
 
+const (
+	maxCachedDBs = 14
+)
+
 // Manager coordinates opening, closing, querying, and inserting into daily SQLite databases.
 type Manager struct {
-	dataDir string
-	mu      sync.RWMutex
-	dbs     map[string]*sql.DB
+	dataDir    string
+	mu         sync.RWMutex
+	dbs        map[string]*sql.DB
+	lastAccess map[string]time.Time
 }
 
 // NewManager creates a new storage Manager for the given data directory.
@@ -60,26 +65,40 @@ func NewManager(dataDir string) (*Manager, error) {
 		return nil, fmt.Errorf("creating data directory %s: %w", dataDir, err)
 	}
 	return &Manager{
-		dataDir: dataDir,
-		dbs:     make(map[string]*sql.DB),
+		dataDir:    dataDir,
+		dbs:        make(map[string]*sql.DB),
+		lastAccess: make(map[string]time.Time),
 	}, nil
 }
 
 // getDBForDate returns or opens the SQLite database for a specific UTC date (YYYY-MM-DD).
 func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
-	m.mu.RLock()
-	db, ok := m.dbs[dateStr]
-	m.mu.RUnlock()
-	if ok {
-		return db, nil
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Double check after obtaining write lock
 	if db, ok := m.dbs[dateStr]; ok {
+		m.lastAccess[dateStr] = time.Now()
 		return db, nil
+	}
+
+	// Evict least recently accessed database connection if cache exceeds maxCachedDBs
+	if len(m.dbs) >= maxCachedDBs {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, t := range m.lastAccess {
+			if oldestKey == "" || t.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = t
+			}
+		}
+		if oldestDB, exists := m.dbs[oldestKey]; exists {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, _ = oldestDB.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
+			cancel()
+			_ = oldestDB.Close()
+			delete(m.dbs, oldestKey)
+			delete(m.lastAccess, oldestKey)
+		}
 	}
 
 	dbPath := filepath.Join(m.dataDir, fmt.Sprintf("%s.sqlite", dateStr))
@@ -110,6 +129,7 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 	}
 
 	m.dbs[dateStr] = db
+	m.lastAccess[dateStr] = time.Now()
 	return db, nil
 }
 
@@ -268,23 +288,23 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) (
 
 	for rows.Next() {
 		var (
-			id                 int64
-			tsNano             int64
-			tsISO              string
-			lat, lon           float64
-			alt, speed, course *float64
-			hAcc, vAcc         *float64
+			id                  int64
+			tsNano              int64
+			tsISO               string
+			lat, lon            float64
+			alt, speed, course  *float64
+			hAcc, vAcc          *float64
 			speedAcc, courseAcc *float64
-			motionStr          sql.NullString
-			batteryState       string
-			batteryLevel       *float64
-			wifi, devID, unqID string
-			pausesVal          sql.NullInt64
-			activity           string
-			desiredAcc, defVal *float64
-			sigChange          string
-			locInPayload       int
-			extraStr           sql.NullString
+			motionStr           sql.NullString
+			batteryState        string
+			batteryLevel        *float64
+			wifi, devID, unqID  string
+			pausesVal           sql.NullInt64
+			activity            string
+			desiredAcc, defVal  *float64
+			sigChange           string
+			locInPayload        int
+			extraStr            sql.NullString
 		)
 
 		err := rows.Scan(
@@ -369,5 +389,6 @@ func (m *Manager) Close() error {
 		}
 	}
 	m.dbs = make(map[string]*sql.DB)
+	m.lastAccess = make(map[string]time.Time)
 	return firstErr
 }

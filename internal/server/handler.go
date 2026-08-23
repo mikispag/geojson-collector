@@ -169,8 +169,7 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		duration := time.Since(start)
-		_ = duration // available for extended logging if desired
+		s.logger.Printf("%s %s in %v", r.Method, r.URL.Path, time.Since(start))
 	})
 }
 

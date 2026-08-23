@@ -38,11 +38,11 @@ func RecordToFeature(rec *LocationRecord) GeoJSONFeature {
 		props[k] = v
 	}
 
-	// Standard timestamp in RFC3339 format
-	if rec.TimestampISO != "" {
-		props["timestamp"] = rec.TimestampISO
-	} else {
-		props["timestamp"] = rec.Timestamp.UTC().Format(time.RFC3339)
+	// Standard timestamp in RFC3339 format for Timelinize compatibility
+	rfc3339TS := rec.Timestamp.UTC().Format(time.RFC3339)
+	props["timestamp"] = rfc3339TS
+	if rec.TimestampISO != "" && rec.TimestampISO != rfc3339TS {
+		props["timestamp_iso"] = rec.TimestampISO
 	}
 
 	if rec.Altitude != nil {

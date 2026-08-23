@@ -32,11 +32,12 @@ func NewDaemon(cfg *config.Config, mgr *storage.Manager, logger *log.Logger) *Da
 	srv := New(cfg, mgr, logger)
 
 	httpServer := &http.Server{
-		Addr:         cfg.ListenAddr(),
-		Handler:      srv.Routes(),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              cfg.ListenAddr(),
+		Handler:           srv.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	return &Daemon{

@@ -131,6 +131,12 @@ func TestOverlandPayloadParsing(t *testing.T) {
 	if feat.Properties["accuracy"] != 30.0 {
 		t.Errorf("expected accuracy 30, got %v", feat.Properties["accuracy"])
 	}
+	if feat.Properties["timestamp"] != "2015-10-01T15:00:00Z" {
+		t.Errorf("expected timestamp 2015-10-01T15:00:00Z, got %v", feat.Properties["timestamp"])
+	}
+	if feat.Properties["timestamp_iso"] != "2015-10-01T08:00:00-0700" {
+		t.Errorf("expected timestamp_iso 2015-10-01T08:00:00-0700, got %v", feat.Properties["timestamp_iso"])
+	}
 	if feat.Properties["custom_meta"] != "extra_val" {
 		t.Errorf("expected extra custom_meta preserved, got %v", feat.Properties["custom_meta"])
 	}

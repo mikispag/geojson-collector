@@ -12,7 +12,7 @@ import (
 )
 
 // ParseTimeFlag parses either a "YYYY-MM-DD" date or a full RFC3339 / ISO8601 timestamp string.
-// If isEnd is true and the input is a date (YYYY-MM-DD), it sets the time to the last millisecond of the day (23:59:59.999999999 UTC).
+// If isEnd is true and the input is a date (YYYY-MM-DD), it sets the time to the end of the day (23:59:59.999999999 UTC).
 // If isEnd is false and the input is a date (YYYY-MM-DD), it sets the time to the start of the day (00:00:00 UTC).
 func ParseTimeFlag(input string, isEnd bool) (time.Time, error) {
 	if input == "" {

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-
 	"github.com/mikispag/geojson-collector/internal/config"
 	"github.com/mikispag/geojson-collector/internal/exporter"
 	"github.com/mikispag/geojson-collector/internal/models"

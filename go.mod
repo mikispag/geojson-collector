@@ -1,6 +1,6 @@
 module github.com/mikispag/geojson-collector
 
-go 1.26.6
+go 1.25.0
 
 require modernc.org/sqlite v1.57.0
 

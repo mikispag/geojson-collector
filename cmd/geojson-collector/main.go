@@ -75,7 +75,7 @@ Flags:
 Time Format Details:
   If a simple date "YYYY-MM-DD" is provided:
     --from starts at the beginning of the day (00:00:00.000000000 UTC).
-    --to ends at the last millisecond of the day (23:59:59.999999999 UTC).
+    --to ends at the end of the day (23:59:59.999999999 UTC).
   Full ISO8601/RFC3339 timestamps (e.g. "2026-08-23T14:30:00+02:00") are also supported.
 `
 
@@ -227,9 +227,8 @@ func runExport(args []string) error {
 	}
 
 	if fromStr == "" || toStr == "" {
-		fmt.Fprintln(os.Stderr, "Error: both --from and --to flags are required.")
-		fmt.Print(exportHelp)
-		os.Exit(1)
+		fmt.Fprint(os.Stderr, exportHelp)
+		return fmt.Errorf("both --from and --to flags are required")
 	}
 
 	fromTime, err := exporter.ParseTimeFlag(fromStr, false)
@@ -244,7 +243,10 @@ func runExport(args []string) error {
 
 	if dataDir == "" {
 		// Try loading from config if specified, or fallback to default
-		cfg, _ := config.LoadConfig(configPath)
+		cfg, err := config.LoadConfig(configPath)
+		if err != nil && configPath != "" {
+			return fmt.Errorf("loading configuration: %w", err)
+		}
 		if cfg != nil && cfg.DataDir != "" {
 			dataDir = cfg.DataDir
 		} else {

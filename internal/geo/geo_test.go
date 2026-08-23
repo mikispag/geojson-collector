@@ -35,7 +35,7 @@ func TestHaversineDistance(t *testing.T) {
 }
 
 func TestValidateLocation(t *testing.T) {
-	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 
 	speed := 25.0
 	course := 90.0
@@ -100,21 +100,23 @@ func TestValidateLocation(t *testing.T) {
 }
 
 func TestFindDuplicate(t *testing.T) {
-	t0 := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	t0 := time.Now().UTC()
 
 	existing := []models.LocationRecord{
 		{
 			Timestamp: t0,
 			Latitude:  47.376900,
 			Longitude: 8.541700,
+			DeviceID:  "device-A",
 		},
 	}
 
-	// Duplicate: same location 10 seconds later
+	// Duplicate: same location 10 seconds later, same device
 	cand1 := &models.LocationRecord{
 		Timestamp: t0.Add(10 * time.Second),
 		Latitude:  47.376900,
 		Longitude: 8.541700,
+		DeviceID:  "device-A",
 	}
 
 	dup := geo.FindDuplicate(existing, cand1, 1.0, 1*time.Minute)
@@ -125,11 +127,23 @@ func TestFindDuplicate(t *testing.T) {
 		t.Errorf("expected time diff 10s, got %v", dup.TimeDiff)
 	}
 
+	// Non-duplicate: same location 10 seconds later, but DIFFERENT device
+	candDiffDevice := &models.LocationRecord{
+		Timestamp: t0.Add(10 * time.Second),
+		Latitude:  47.376900,
+		Longitude: 8.541700,
+		DeviceID:  "device-B",
+	}
+	if d := geo.FindDuplicate(existing, candDiffDevice, 1.0, 1*time.Minute); d != nil {
+		t.Errorf("expected different device not to be deduplicated, got %+v", d)
+	}
+
 	// Non-duplicate: moved 50 meters away
 	cand2 := &models.LocationRecord{
 		Timestamp: t0.Add(10 * time.Second),
 		Latitude:  47.377300, // ~44m away
 		Longitude: 8.541700,
+		DeviceID:  "device-A",
 	}
 	if d := geo.FindDuplicate(existing, cand2, 1.0, 1*time.Minute); d != nil {
 		t.Errorf("expected no duplicate for 44m move, got %+v", d)
@@ -140,6 +154,7 @@ func TestFindDuplicate(t *testing.T) {
 		Timestamp: t0.Add(5 * time.Minute),
 		Latitude:  47.376900,
 		Longitude: 8.541700,
+		DeviceID:  "device-A",
 	}
 	if d := geo.FindDuplicate(existing, cand3, 1.0, 1*time.Minute); d != nil {
 		t.Errorf("expected no duplicate for 5 min dt, got %+v", d)

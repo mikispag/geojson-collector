@@ -24,6 +24,11 @@ func FindDuplicate(existingRecords []models.LocationRecord, candidate *models.Lo
 	candTime := candidate.Timestamp
 
 	for _, rec := range existingRecords {
+		// Only deduplicate points from the same device if device_id is specified
+		if candidate.DeviceID != "" && rec.DeviceID != "" && candidate.DeviceID != rec.DeviceID {
+			continue
+		}
+
 		// Calculate time difference
 		var dt time.Duration
 		if rec.Timestamp.After(candTime) {

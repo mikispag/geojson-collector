@@ -55,6 +55,7 @@ func DefaultConfig() *Config {
 func LoadConfig(configPath string) (*Config, error) {
 	cfg := DefaultConfig()
 
+	explicit := true
 	// If no path was explicitly passed, check environment variable GEOJSON_COLLECTOR_CONFIG
 	if configPath == "" {
 		configPath = os.Getenv("GEOJSON_COLLECTOR_CONFIG")
@@ -63,6 +64,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	// If still empty, use DefaultConfigPath
 	if configPath == "" {
 		configPath = DefaultConfigPath
+		explicit = false
 	}
 
 	// Try reading file if it exists
@@ -70,8 +72,8 @@ func LoadConfig(configPath string) (*Config, error) {
 		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parsing config file %s: %w", configPath, err)
 		}
-	} else if !os.IsNotExist(err) && configPath != DefaultConfigPath {
-		// If explicit path failed with error other than not found, return error
+	} else if explicit || !os.IsNotExist(err) {
+		// Return error if explicit path was missing/unreadable, or default path had non-ENOENT error
 		return nil, fmt.Errorf("reading config file %s: %w", configPath, err)
 	}
 
@@ -121,6 +123,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DedupIntervalSeconds < 0 {
 		return fmt.Errorf("dedup_interval_seconds cannot be negative: %v", c.DedupIntervalSeconds)
+	}
+	if c.DedupIntervalSeconds > 86400*365 {
+		return fmt.Errorf("dedup_interval_seconds exceeds maximum allowed (1 year): %v", c.DedupIntervalSeconds)
 	}
 	return nil
 }

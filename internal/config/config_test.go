@@ -82,7 +82,7 @@ func TestEnvOverrides(t *testing.T) {
 		os.Unsetenv("GEOJSON_COLLECTOR_DATA_DIR")
 	}()
 
-	cfg, err := config.LoadConfig("/non-existent-default/path/test.json")
+	cfg, err := config.LoadConfig("")
 	if err != nil {
 		t.Fatalf("failed to load config with env: %v", err)
 	}
@@ -98,5 +98,12 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if cfg.DataDir != "/custom/data" {
 		t.Errorf("expected data dir /custom/data, got %s", cfg.DataDir)
+	}
+}
+
+func TestLoadConfig_MissingExplicitPath(t *testing.T) {
+	_, err := config.LoadConfig("/non-existent/explicit/config.json")
+	if err == nil {
+		t.Fatal("expected error when explicit config path does not exist, got nil")
 	}
 }
