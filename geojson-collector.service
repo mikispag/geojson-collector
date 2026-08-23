@@ -13,7 +13,6 @@ RestartSec=5s
 
 # Directory Management
 StateDirectory=geojson-collector
-StateDirectoryMode=0750
 ConfigurationDirectory=geojson-collector
 
 # Hardening

@@ -147,3 +147,43 @@ func TestStorageManager_DailyDBAndWindowQueries(t *testing.T) {
 	_ = db1
 	_ = db2
 }
+
+func TestStorageManager_ReadOnlyQuery(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr, err := storage.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	ctx := context.Background()
+	t0 := time.Now().UTC()
+
+	rec := &models.LocationRecord{
+		Timestamp:    t0,
+		TimestampISO: t0.Format(time.RFC3339),
+		Latitude:     47.3769,
+		Longitude:    8.5417,
+	}
+
+	if err := mgr.InsertLocation(ctx, rec); err != nil {
+		t.Fatalf("failed to insert: %v", err)
+	}
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
+
+	// Create a new manager instance and perform a read-only query
+	readMgr, err := storage.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("failed to init read manager: %v", err)
+	}
+	defer readMgr.Close()
+
+	recs, err := readMgr.GetLocationsInRange(ctx, t0.Add(-time.Hour), t0.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("GetLocationsInRange failed on read-only open: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(recs))
+	}
+}

@@ -61,8 +61,10 @@ type Manager struct {
 
 // NewManager creates a new storage Manager for the given data directory.
 func NewManager(dataDir string) (*Manager, error) {
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return nil, fmt.Errorf("creating data directory %s: %w", dataDir, err)
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dataDir, 0755); err != nil {
+			return nil, fmt.Errorf("creating data directory %s: %w", dataDir, err)
+		}
 	}
 	return &Manager{
 		dataDir:    dataDir,
@@ -72,7 +74,8 @@ func NewManager(dataDir string) (*Manager, error) {
 }
 
 // getDBForDate returns or opens the SQLite database for a specific UTC date (YYYY-MM-DD).
-func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
+// If readOnly is true, it opens the database in read-only mode without executing WAL pragma or DDL.
+func (m *Manager) getDBForDate(dateStr string, readOnly bool) (*sql.DB, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -102,6 +105,17 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 	}
 
 	dbPath := filepath.Join(m.dataDir, fmt.Sprintf("%s.sqlite", dateStr))
+
+	if readOnly {
+		dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)", dbPath)
+		db, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("opening read-only sqlite database %s: %w", dbPath, err)
+		}
+		m.dbs[dateStr] = db
+		m.lastAccess[dateStr] = time.Now()
+		return db, nil
+	}
 
 	// Open with pragmas configured for WAL mode and robust crash tolerance
 	// _pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)
@@ -140,7 +154,7 @@ func (m *Manager) InsertLocation(ctx context.Context, loc *models.LocationRecord
 	}
 
 	dateStr := loc.Timestamp.UTC().Format("2006-01-02")
-	db, err := m.getDBForDate(dateStr)
+	db, err := m.getDBForDate(dateStr, false)
 	if err != nil {
 		return err
 	}
@@ -243,7 +257,7 @@ func (m *Manager) GetLocationsInWindow(ctx context.Context, start, end time.Time
 			}
 		}
 
-		db, err := m.getDBForDate(dateStr)
+		db, err := m.getDBForDate(dateStr, true)
 		if err != nil {
 			return nil, err
 		}
