@@ -225,3 +225,40 @@ func TestStorageManager_QueryThenInsertInReadWriteManager(t *testing.T) {
 		t.Fatalf("InsertLocation failed after window query: %v", err)
 	}
 }
+
+func TestStorageManager_HistoricalBackfillMultipleDays(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr, err := storage.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	defer mgr.Close()
+
+	ctx := context.Background()
+	baseDate := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	// Backfill points over 7 different past days
+	for i := 0; i < 7; i++ {
+		ts := baseDate.AddDate(0, 0, i)
+		rec := &models.LocationRecord{
+			Timestamp:    ts,
+			TimestampISO: ts.Format(time.RFC3339),
+			Latitude:     47.0 + float64(i)*0.01,
+			Longitude:    8.0 + float64(i)*0.01,
+		}
+		if err := mgr.InsertLocation(ctx, rec); err != nil {
+			t.Fatalf("failed inserting historical point for %s: %v", ts.Format("2006-01-02"), err)
+		}
+	}
+
+	// Verify all 7 records across the range
+	start := baseDate.AddDate(0, 0, -1)
+	end := baseDate.AddDate(0, 0, 8)
+	recs, err := mgr.GetLocationsInRange(ctx, start, end)
+	if err != nil {
+		t.Fatalf("GetLocationsInRange failed: %v", err)
+	}
+	if len(recs) != 7 {
+		t.Fatalf("expected 7 historical records across 7 days, got %d", len(recs))
+	}
+}

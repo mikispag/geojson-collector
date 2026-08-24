@@ -48,7 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_locations_coords ON locations(latitude, longitude
 `
 
 const (
-	maxCachedDBs = 14
+	maxCachedDBs = 2
 )
 
 // Manager coordinates opening, closing, querying, and inserting into daily SQLite databases.
@@ -96,8 +96,8 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 		return db, nil
 	}
 
-	// Evict least recently accessed database connection if cache exceeds maxCachedDBs
-	if len(m.dbs) >= maxCachedDBs {
+	// Evict least recently accessed database connections if cache exceeds maxCachedDBs
+	for len(m.dbs) >= maxCachedDBs {
 		var oldestKey string
 		var oldestTime time.Time
 		for k, t := range m.lastAccess {
@@ -113,6 +113,8 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 			_ = oldestDB.Close()
 			delete(m.dbs, oldestKey)
 			delete(m.lastAccess, oldestKey)
+		} else {
+			break
 		}
 	}
 
