@@ -1,6 +1,7 @@
 package exporter
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -54,39 +55,59 @@ func ExportGeoJSON(ctx context.Context, mgr *storage.Manager, from, to time.Time
 		return fmt.Errorf("--from (%v) cannot be after --to (%v)", from, to)
 	}
 
-	records, err := mgr.GetLocationsInRange(ctx, from, to)
-	if err != nil {
-		return fmt.Errorf("querying locations for export: %w", err)
-	}
-
-	fc := models.GeoJSONFeatureCollection{
-		Type:     "FeatureCollection",
-		Features: make([]models.GeoJSONFeature, 0, len(records)),
-	}
-
-	for i := range records {
-		fc.Features = append(fc.Features, models.RecordToFeature(&records[i]))
-	}
-
-	var out []byte
+	// Bound memory to the writer buffer and one feature, even for multi-year exports.
+	out := bufio.NewWriter(w)
+	header, separator, footer := `{"type":"FeatureCollection","features":[`, ",", "]}\n"
 	if pretty {
-		out, err = json.MarshalIndent(fc, "", "  ")
-	} else {
-		out, err = json.Marshal(fc)
+		header = "{\n  \"type\": \"FeatureCollection\",\n  \"features\": ["
+		separator = ",\n"
+		footer = "\n  ]\n}\n"
 	}
-
+	if _, err := out.WriteString(header); err != nil {
+		return fmt.Errorf("writing GeoJSON header: %w", err)
+	}
+	first := true
+	err := mgr.VisitLocationsInRange(ctx, from, to, func(rec models.LocationRecord) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		feature := models.RecordToFeature(&rec)
+		var data []byte
+		var err error
+		if pretty {
+			data, err = json.MarshalIndent(feature, "    ", "  ")
+		} else {
+			data, err = json.Marshal(feature)
+		}
+		if err != nil {
+			return fmt.Errorf("serializing GeoJSON feature: %w", err)
+		}
+		if !first {
+			if _, err := out.WriteString(separator); err != nil {
+				return err
+			}
+		} else if pretty {
+			if _, err := out.WriteString("\n"); err != nil {
+				return err
+			}
+		}
+		first = false
+		if pretty {
+			if _, err := out.WriteString("    "); err != nil {
+				return err
+			}
+		}
+		_, err = out.Write(data)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("serializing GeoJSON: %w", err)
+		return fmt.Errorf("exporting locations: %w", err)
 	}
-
-	if _, err := w.Write(out); err != nil {
+	if _, err := out.WriteString(footer); err != nil {
+		return fmt.Errorf("writing GeoJSON footer: %w", err)
+	}
+	if err := out.Flush(); err != nil {
 		return fmt.Errorf("writing GeoJSON output: %w", err)
 	}
-
-	// Append trailing newline
-	if _, err := w.Write([]byte("\n")); err != nil {
-		return fmt.Errorf("writing trailing newline: %w", err)
-	}
-
 	return nil
 }

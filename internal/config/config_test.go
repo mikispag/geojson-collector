@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,19 @@ import (
 
 	"github.com/mikispag/geojson-collector/internal/config"
 )
+
+func isolateConfig(t *testing.T) string {
+	t.Helper()
+	for _, key := range []string{"CONFIG", "HOST", "PORT", "AUTH_TOKEN", "DATA_DIR", "DEDUP_RADIUS", "DEDUP_INTERVAL"} {
+		t.Setenv("GEOJSON_COLLECTOR_"+key, "")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GEOJSON_COLLECTOR_CONFIG", path)
+	return path
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := config.DefaultConfig()
@@ -29,6 +43,7 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestLoadConfigFile(t *testing.T) {
+	isolateConfig(t)
 	tempDir := t.TempDir()
 	confPath := filepath.Join(tempDir, "config.json")
 
@@ -71,16 +86,11 @@ func TestLoadConfigFile(t *testing.T) {
 }
 
 func TestEnvOverrides(t *testing.T) {
-	os.Setenv("GEOJSON_COLLECTOR_HOST", "0.0.0.0")
-	os.Setenv("GEOJSON_COLLECTOR_PORT", "9999")
-	os.Setenv("GEOJSON_COLLECTOR_AUTH_TOKEN", "env-token")
-	os.Setenv("GEOJSON_COLLECTOR_DATA_DIR", "/custom/data")
-	defer func() {
-		os.Unsetenv("GEOJSON_COLLECTOR_HOST")
-		os.Unsetenv("GEOJSON_COLLECTOR_PORT")
-		os.Unsetenv("GEOJSON_COLLECTOR_AUTH_TOKEN")
-		os.Unsetenv("GEOJSON_COLLECTOR_DATA_DIR")
-	}()
+	isolateConfig(t)
+	t.Setenv("GEOJSON_COLLECTOR_HOST", "0.0.0.0")
+	t.Setenv("GEOJSON_COLLECTOR_PORT", "9999")
+	t.Setenv("GEOJSON_COLLECTOR_AUTH_TOKEN", "env-token")
+	t.Setenv("GEOJSON_COLLECTOR_DATA_DIR", "/custom/data")
 
 	cfg, err := config.LoadConfig("")
 	if err != nil {
@@ -102,8 +112,55 @@ func TestEnvOverrides(t *testing.T) {
 }
 
 func TestLoadConfig_MissingExplicitPath(t *testing.T) {
-	_, err := config.LoadConfig("/non-existent/explicit/config.json")
+	isolateConfig(t)
+	_, err := config.LoadConfig(filepath.Join(t.TempDir(), "missing.json"))
 	if err == nil {
 		t.Fatal("expected error when explicit config path does not exist, got nil")
+	}
+}
+
+func TestLoadConfigRejectsInvalidEnvironment(t *testing.T) {
+	for key, values := range map[string][]string{
+		"PORT":           {"invalid", "0", "-1", "65536"},
+		"DEDUP_RADIUS":   {"invalid", "-1", "NaN", "+Inf", "-Inf"},
+		"DEDUP_INTERVAL": {"invalid", "-1", "NaN", "+Inf", "-Inf", "31536001"},
+	} {
+		for _, value := range values {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				isolateConfig(t)
+				t.Setenv("GEOJSON_COLLECTOR_"+key, value)
+				if _, err := config.LoadConfig(""); err == nil {
+					t.Fatalf("accepted %s=%q", key, value)
+				}
+			})
+		}
+	}
+}
+
+func TestValidateRejectsNonfiniteValues(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		cfg := config.DefaultConfig()
+		cfg.DedupRadiusMeters = value
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("accepted radius %v", value)
+		}
+		cfg = config.DefaultConfig()
+		cfg.DedupIntervalSeconds = value
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("accepted interval %v", value)
+		}
+	}
+}
+
+func TestListenAddr(t *testing.T) {
+	for host, want := range map[string]string{
+		"": ":9696", "127.0.0.1": "127.0.0.1:9696", "localhost": "localhost:9696",
+		"::1": "[::1]:9696", "::": "[::]:9696", "fe80::1%eth0": "[fe80::1%eth0]:9696",
+	} {
+		cfg := config.DefaultConfig()
+		cfg.Host = host
+		if got := cfg.ListenAddr(); got != want {
+			t.Errorf("host %q: got %q, want %q", host, got, want)
+		}
 	}
 }

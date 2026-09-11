@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -158,4 +160,137 @@ func TestExportGeoJSON(t *testing.T) {
 	if props["wifi"] != "ZRH_WiFi" {
 		t.Errorf("expected wifi ZRH_WiFi, got %v", props["wifi"])
 	}
+}
+
+func exportTestRecords(t *testing.T, perDay int) (*storage.Manager, time.Time, time.Time) {
+	t.Helper()
+	mgr, err := storage.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mgr.Close() })
+	start := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+	// Insert in reverse order to exercise ordering within and across partitions.
+	for day := 2; day >= 0; day-- {
+		for i := perDay - 1; i >= 0; i-- {
+			ts := start.AddDate(0, 0, day).Add(time.Duration(i) * time.Second)
+			err := mgr.InsertLocation(context.Background(), &models.LocationRecord{
+				Timestamp:    ts,
+				TimestampISO: ts.Format(time.RFC3339),
+				Latitude:     47.3769,
+				Longitude:    8.5417,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return mgr, start, start.AddDate(0, 0, 3).Add(-time.Nanosecond)
+}
+
+func TestExportGeoJSONCollections(t *testing.T) {
+	mgr, start, end := exportTestRecords(t, 2)
+	for _, tc := range []struct {
+		name   string
+		pretty bool
+		empty  bool
+	}{
+		{name: "compact"},
+		{name: "pretty", pretty: true},
+		{name: "empty compact", empty: true},
+		{name: "empty pretty", pretty: true, empty: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			from, to, expected := start, end, 6
+			if tc.empty {
+				from, to, expected = start.AddDate(0, 0, 3), end.AddDate(0, 0, 3), 0
+			}
+			var buf bytes.Buffer
+			if err := exporter.ExportGeoJSON(context.Background(), mgr, from, to, &buf, tc.pretty); err != nil {
+				t.Fatal(err)
+			}
+			var fc models.GeoJSONFeatureCollection
+			if err := json.Unmarshal(buf.Bytes(), &fc); err != nil {
+				t.Fatalf("invalid GeoJSON: %v", err)
+			}
+			if fc.Type != "FeatureCollection" || fc.Features == nil || len(fc.Features) != expected {
+				t.Fatalf("unexpected collection: type=%s features=%v", fc.Type, fc.Features)
+			}
+			for i, feature := range fc.Features {
+				expectedTime := start.AddDate(0, 0, i/2).Add(time.Duration(i%2) * time.Second)
+				if feature.Type != "Feature" || feature.Geometry.Type != "Point" || feature.Properties["timestamp"] != expectedTime.Format(time.RFC3339) {
+					t.Errorf("unexpected feature #%d: %+v", i, feature)
+				}
+			}
+			if tc.pretty && !bytes.Contains(buf.Bytes(), []byte("\n  \"features\":")) {
+				t.Error("pretty output is not indented")
+			}
+			if !tc.pretty && bytes.Count(buf.Bytes(), []byte("\n")) != 1 {
+				t.Error("compact output must have only its trailing newline")
+			}
+		})
+	}
+}
+
+type exportWriterFunc func([]byte) (int, error)
+
+func (f exportWriterFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestExportGeoJSONStreamsOutput(t *testing.T) {
+	mgr, start, end := exportTestRecords(t, 32)
+	for _, pretty := range []bool{false, true} {
+		var buf bytes.Buffer
+		writes := 0
+		writer := exportWriterFunc(func(p []byte) (int, error) {
+			writes++
+			if len(p) > 4096 {
+				return 0, errors.New("output was not streamed in bounded writes")
+			}
+			return buf.Write(p)
+		})
+		if err := exporter.ExportGeoJSON(context.Background(), mgr, start, end, writer, pretty); err != nil {
+			t.Fatalf("pretty=%v: %v", pretty, err)
+		}
+		var fc models.GeoJSONFeatureCollection
+		if err := json.Unmarshal(buf.Bytes(), &fc); err != nil || len(fc.Features) != 96 || writes < 2 {
+			t.Fatalf("pretty=%v: features=%d writes=%d error=%v", pretty, len(fc.Features), writes, err)
+		}
+	}
+}
+
+func TestExportGeoJSONOutputFailures(t *testing.T) {
+	mgr, start, end := exportTestRecords(t, 32)
+	t.Run("short write", func(t *testing.T) {
+		writer := exportWriterFunc(func(p []byte) (int, error) { return len(p) - 1, nil })
+		err := exporter.ExportGeoJSON(context.Background(), mgr, start, end, writer, false)
+		if !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("expected io.ErrShortWrite, got %v", err)
+		}
+	})
+	t.Run("writer error", func(t *testing.T) {
+		writeErr := errors.New("output unavailable")
+		writes := 0
+		writer := exportWriterFunc(func(p []byte) (int, error) {
+			writes++
+			return 0, writeErr
+		})
+		err := exporter.ExportGeoJSON(context.Background(), mgr, start, end, writer, false)
+		if !errors.Is(err, writeErr) || writes != 1 {
+			t.Fatalf("expected writer error without further writes, got error=%v writes=%d", err, writes)
+		}
+	})
+	t.Run("canceled during output", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		writes := 0
+		writer := exportWriterFunc(func(p []byte) (int, error) {
+			writes++
+			cancel()
+			return len(p), nil
+		})
+		err := exporter.ExportGeoJSON(ctx, mgr, start, end, writer, false)
+		if !errors.Is(err, context.Canceled) || writes != 1 {
+			t.Fatalf("expected cancellation without further writes, got error=%v writes=%d", err, writes)
+		}
+	})
 }

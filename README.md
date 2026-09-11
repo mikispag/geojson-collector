@@ -14,8 +14,8 @@ A lightweight, robust, and zero-CGO Go daemon and CLI tool to collect real-time 
 
 * **Overland Webhook Server:** Collects batched location updates via HTTP `POST /api` with Bearer token authentication.
 * **Daily Partitioned Storage:** Automatically stores records into UTC daily SQLite databases (`/var/lib/geojson-collector/YYYY-MM-DD.sqlite`).
-* **Sudden Termination & Crash Resilience:** Runs SQLite with Write-Ahead Logging (`WAL`), `synchronous = NORMAL`, and `busy_timeout = 5000` to guarantee high throughput and zero corruption on abrupt restarts or power loss.
-* **Intelligent Deduplication:** Prevents duplicate stationary points within a configurable radius (default `1.0m`) and time delta (default `60s`), evaluating across UTC midnight boundaries seamlessly.
+* **Sudden Termination & Crash Resilience:** Runs SQLite with Write-Ahead Logging (`WAL`), `synchronous = FULL`, and `busy_timeout = 5000`. Each committed location is synced before acknowledgment, including across power loss when the filesystem and storage hardware honor sync requests.
+* **Intelligent Deduplication:** Prevents duplicate stationary samples from the same device within a configurable radius (default `1.0m`) and time delta (default `60s`), including concurrent requests to the daemon and UTC midnight boundaries. Uses `unique_id` when available, otherwise `device_id`; unidentified devices share a separate group. Trip and action events are retained, with exact event retries deduplicated.
 * **Sanity & Telemetry Filtering:** Rejects corrupted GPS coordinates, unphysical speeds (e.g. supersonic glitches > Mach 3), clock-drift future timestamps, or malformed data while logging warnings to `stderr`.
 * **Timelinize-Ready RFC 7946 GeoJSON Exporter:** CLI `export` subcommand extracts time intervals into standard GeoJSON FeatureCollections, mapped with well-known keys (`velocity`, `heading`, `accuracy`, `altitude`, `timestamp`, `motion`, `battery_level`, `wifi`, etc.) directly consumable by the Timelinize GeoJSON importer.
 * **Zero CGO:** Built on pure Go (`modernc.org/sqlite`) for single-binary portability across Linux (amd64, arm64, riscv64), macOS, and BSD.
@@ -63,7 +63,7 @@ flowchart TD
 
 ### From Source
 
-Ensure Go 1.24+ is installed:
+Ensure Go 1.25+ is installed:
 
 ```bash
 git clone https://github.com/mikispag/geojson-collector.git
@@ -169,7 +169,19 @@ geojson-collector serve --port 9696 --auth-token "mytoken" --data-dir /var/lib/g
 
 ### 2. Exporting GeoJSON
 
-The `export` subcommand extracts points for any arbitrary time range into standard RFC 7946 GeoJSON.
+The `export` subcommand streams points for any arbitrary time range into standard RFC 7946 GeoJSON, preserving fractional timestamp precision. File output replaces an existing export only after the new export completes successfully. It refuses to overwrite daily SQLite databases, their sidecars, or the configuration file it loaded.
+
+For databases owned by the systemd service, run the exporter as the service account and redirect stdout from your own shell:
+
+```bash
+sudo -u geojson-collector geojson-collector export \
+  --from 2026-08-01 \
+  --to 2026-08-23 \
+  --data-dir /var/lib/geojson-collector \
+  --pretty > august_track.geojson
+```
+
+The shell creates the output under your account. SQLite opens the databases read-only, but WAL mode still requires readable existing `-wal` and `-shm` sidecars or permission to create them in the data directory. Group read access alone can therefore fail after the writer closes and removes those sidecars. Running as the service account supplies the required directory access. An explicit `--data-dir` also skips the private default configuration unless `--config` or `GEOJSON_COLLECTOR_CONFIG` selects a configuration file.
 
 #### Date-only Range (`YYYY-MM-DD`):
 When date-only format is specified:
@@ -257,11 +269,19 @@ CREATE INDEX IF NOT EXISTS idx_locations_coords ON locations(latitude, longitude
 On each opened connection, the daemon enforces:
 ```sql
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
+PRAGMA synchronous = FULL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA temp_store = MEMORY;
 ```
+
+`FULL` syncs the WAL for each transaction before the server acknowledges the location. `NORMAL` would preserve database consistency after a power failure but could lose recently acknowledged commits. Power-failure durability depends on the filesystem and storage hardware honoring sync requests.
+
+Accepted points in an upload commit in one transaction per UTC day. If a later day's transaction fails, earlier days may already be committed; retrying the upload deduplicates those points. The daemon caches at most two daily databases with one SQLite connection each.
+
+Malformed features are skipped individually so valid neighboring records can still be stored. Numeric timestamps retain nanosecond precision, and an unknown iOS battery level (`-1`) is omitted without discarding the location.
+
+When an older partition is opened for writing, nonfinite `altitude`, `desired_accuracy`, and `deferred` values are converted to SQL `NULL`, preserving the location and its valid telemetry. Read-only exports omit those invalid optional values without modifying the database.
 
 ---
 
@@ -295,7 +315,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now geojson-collector
 ```
 
-`/var/lib/geojson-collector` is provisioned automatically with `0750` permissions by `systemd` via `StateDirectory=geojson-collector` when the service starts.
+`/var/lib/geojson-collector` is provisioned automatically with `0750` permissions by `systemd` via `StateDirectory=geojson-collector` and `StateDirectoryMode=0750` when the service starts. `UMask=0027` keeps new files inaccessible to other local users. The daemon tightens permissions on its data directory and existing daily SQLite, WAL, and SHM files at startup, allowing at most `0750` on the directory and `0640` on files while preserving stricter modes.
 
 ### 3. Check Status & Logs
 

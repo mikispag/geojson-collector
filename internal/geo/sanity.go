@@ -21,18 +21,47 @@ var (
 	MinAllowedTimestamp = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 )
 
-// ValidateLocation performs sanity checks on a LocationRecord.
-// Returns an error if the data is malformed or physically impossible.
-func ValidateLocation(loc *models.LocationRecord, now time.Time) error {
+// ValidateFiniteNumbers rejects numeric telemetry that cannot be represented in JSON.
+func ValidateFiniteNumbers(loc *models.LocationRecord) error {
 	if loc == nil {
 		return fmt.Errorf("nil location record")
 	}
+	for _, field := range []struct {
+		name  string
+		value *float64
+	}{
+		{"latitude", &loc.Latitude},
+		{"longitude", &loc.Longitude},
+		{"altitude", loc.Altitude},
+		{"speed", loc.Speed},
+		{"course", loc.Course},
+		{"horizontal_accuracy", loc.HorizontalAccuracy},
+		{"vertical_accuracy", loc.VerticalAccuracy},
+		{"speed_accuracy", loc.SpeedAccuracy},
+		{"course_accuracy", loc.CourseAccuracy},
+		{"battery_level", loc.BatteryLevel},
+		{"desired_accuracy", loc.DesiredAccuracy},
+		{"deferred", loc.Deferred},
+	} {
+		if field.value != nil && (math.IsNaN(*field.value) || math.IsInf(*field.value, 0)) {
+			return fmt.Errorf("invalid %s: nonfinite number %v", field.name, *field.value)
+		}
+	}
+	return nil
+}
+
+// ValidateLocation performs sanity checks on a LocationRecord.
+// Returns an error if the data is malformed or physically impossible.
+func ValidateLocation(loc *models.LocationRecord, now time.Time) error {
+	if err := ValidateFiniteNumbers(loc); err != nil {
+		return err
+	}
 
 	// Check coordinates
-	if math.IsNaN(loc.Latitude) || math.IsInf(loc.Latitude, 0) || loc.Latitude < -90.0 || loc.Latitude > 90.0 {
+	if loc.Latitude < -90.0 || loc.Latitude > 90.0 {
 		return fmt.Errorf("invalid latitude: %v (must be between -90 and 90)", loc.Latitude)
 	}
-	if math.IsNaN(loc.Longitude) || math.IsInf(loc.Longitude, 0) || loc.Longitude < -180.0 || loc.Longitude > 180.0 {
+	if loc.Longitude < -180.0 || loc.Longitude > 180.0 {
 		return fmt.Errorf("invalid longitude: %v (must be between -180 and 180)", loc.Longitude)
 	}
 
@@ -50,9 +79,6 @@ func ValidateLocation(loc *models.LocationRecord, now time.Time) error {
 	// Check speed
 	if loc.Speed != nil {
 		s := *loc.Speed
-		if math.IsNaN(s) || math.IsInf(s, 0) {
-			return fmt.Errorf("speed is NaN or Inf")
-		}
 		if s < 0 && s != -1 {
 			return fmt.Errorf("negative speed %v", s)
 		}
@@ -64,9 +90,6 @@ func ValidateLocation(loc *models.LocationRecord, now time.Time) error {
 	// Check course
 	if loc.Course != nil {
 		c := *loc.Course
-		if math.IsNaN(c) || math.IsInf(c, 0) {
-			return fmt.Errorf("course is NaN or Inf")
-		}
 		if c < 0 && c != -1 {
 			return fmt.Errorf("negative course %v", c)
 		}
@@ -78,25 +101,25 @@ func ValidateLocation(loc *models.LocationRecord, now time.Time) error {
 	// Check accuracies
 	if loc.HorizontalAccuracy != nil {
 		h := *loc.HorizontalAccuracy
-		if math.IsNaN(h) || math.IsInf(h, 0) || (h < 0 && h != -1) {
+		if h < 0 && h != -1 {
 			return fmt.Errorf("invalid horizontal_accuracy: %v", h)
 		}
 	}
 	if loc.VerticalAccuracy != nil {
 		v := *loc.VerticalAccuracy
-		if math.IsNaN(v) || math.IsInf(v, 0) || (v < 0 && v != -1) {
+		if v < 0 && v != -1 {
 			return fmt.Errorf("invalid vertical_accuracy: %v", v)
 		}
 	}
 	if loc.SpeedAccuracy != nil {
 		sa := *loc.SpeedAccuracy
-		if math.IsNaN(sa) || math.IsInf(sa, 0) || (sa < 0 && sa != -1) {
+		if sa < 0 && sa != -1 {
 			return fmt.Errorf("invalid speed_accuracy: %v", sa)
 		}
 	}
 	if loc.CourseAccuracy != nil {
 		ca := *loc.CourseAccuracy
-		if math.IsNaN(ca) || math.IsInf(ca, 0) || (ca < 0 && ca != -1) {
+		if ca < 0 && ca != -1 {
 			return fmt.Errorf("invalid course_accuracy: %v", ca)
 		}
 	}
@@ -104,7 +127,9 @@ func ValidateLocation(loc *models.LocationRecord, now time.Time) error {
 	// Check battery level
 	if loc.BatteryLevel != nil {
 		b := *loc.BatteryLevel
-		if math.IsNaN(b) || math.IsInf(b, 0) || b < 0.0 || b > 1.0 {
+		if b == -1 {
+			loc.BatteryLevel = nil
+		} else if b < 0.0 || b > 1.0 {
 			return fmt.Errorf("invalid battery_level: %v (must be between 0.0 and 1.0)", b)
 		}
 	}

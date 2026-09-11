@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/mikispag/geojson-collector/internal/config"
 	"github.com/mikispag/geojson-collector/internal/exporter"
@@ -154,33 +156,26 @@ func runServe(args []string) error {
 		return err
 	}
 
-	cfg, err := config.LoadConfig(configPath)
+	cfg, err := config.LoadConfigWithOverrides(configPath, func(cfg *config.Config) {
+		fs.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "host":
+				cfg.Host = host
+			case "port", "p":
+				cfg.Port = port
+			case "auth-token", "t":
+				cfg.AuthToken = authToken
+			case "data-dir", "d":
+				cfg.DataDir = dataDir
+			case "dedup-radius":
+				cfg.DedupRadiusMeters = dedupRadius
+			case "dedup-interval":
+				cfg.DedupIntervalSeconds = dedupInterval
+			}
+		})
+	})
 	if err != nil {
 		return fmt.Errorf("loading configuration: %w", err)
-	}
-
-	// Apply CLI flag overrides if explicitly passed
-	if host != "" {
-		cfg.Host = host
-	}
-	if port > 0 {
-		cfg.Port = port
-	}
-	if authToken != "" {
-		cfg.AuthToken = authToken
-	}
-	if dataDir != "" {
-		cfg.DataDir = dataDir
-	}
-	if dedupRadius >= 0 {
-		cfg.DedupRadiusMeters = dedupRadius
-	}
-	if dedupInterval >= 0 {
-		cfg.DedupIntervalSeconds = dedupInterval
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	mgr, err := storage.NewManager(cfg.DataDir)
@@ -241,35 +236,154 @@ func runExport(args []string) error {
 		return fmt.Errorf("invalid --to time: %w", err)
 	}
 
-	if dataDir == "" {
-		// Try loading from config if specified, or fallback to default
-		cfg, err := config.LoadConfig(configPath)
-		if err != nil && configPath != "" {
-			return fmt.Errorf("loading configuration: %w", err)
+	if fromTime.After(toTime) {
+		return fmt.Errorf("--from (%v) cannot be after --to (%v)", fromTime, toTime)
+	}
+
+	var dataDirSet, configSet bool
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "data-dir", "d":
+			dataDirSet = true
+		case "config", "c":
+			configSet = true
 		}
-		if cfg != nil && cfg.DataDir != "" {
-			dataDir = cfg.DataDir
-		} else {
-			dataDir = config.DefaultDataDir
+	})
+	cfg := config.DefaultConfig()
+	loadedConfigPath := ""
+	if dataDirSet && !configSet && os.Getenv("GEOJSON_COLLECTOR_CONFIG") == "" {
+		// An explicit data directory lets exporters run without access to the
+		// daemon's private default configuration.
+		cfg.DataDir = dataDir
+		err = cfg.Validate()
+	} else {
+		loadedConfigPath = configPath
+		if loadedConfigPath == "" {
+			loadedConfigPath = os.Getenv("GEOJSON_COLLECTOR_CONFIG")
+		}
+		if loadedConfigPath == "" {
+			loadedConfigPath = config.DefaultConfigPath
+		}
+		cfg, err = config.LoadConfigWithOverrides(configPath, func(cfg *config.Config) {
+			if dataDirSet {
+				cfg.DataDir = dataDir
+			}
+		})
+	}
+	if err != nil {
+		return fmt.Errorf("loading configuration: %w", err)
+	}
+	if outputPath != "" {
+		if err := validateExportOutput(outputPath, cfg.DataDir, loadedConfigPath); err != nil {
+			return err
 		}
 	}
 
-	mgr, err := storage.NewReadOnlyManager(dataDir)
+	mgr, err := storage.NewReadOnlyManager(cfg.DataDir)
 	if err != nil {
 		return fmt.Errorf("initializing storage manager: %w", err)
 	}
 	defer mgr.Close()
 
-	var outWriter io.Writer = os.Stdout
-	if outputPath != "" {
-		f, err := os.Create(outputPath)
-		if err != nil {
-			return fmt.Errorf("creating output file %s: %w", outputPath, err)
-		}
-		defer f.Close()
-		outWriter = f
+	ctx := context.Background()
+	if outputPath == "" {
+		return exporter.ExportGeoJSON(ctx, mgr, fromTime, toTime, os.Stdout, pretty)
 	}
 
-	ctx := context.Background()
-	return exporter.ExportGeoJSON(ctx, mgr, fromTime, toTime, outWriter, pretty)
+	f, err := os.CreateTemp(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("creating temporary output for %s: %w", outputPath, err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err := exporter.ExportGeoJSON(ctx, mgr, fromTime, toTime, f, pretty); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("syncing output file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing output file: %w", err)
+	}
+	if err := os.Rename(f.Name(), outputPath); err != nil {
+		return fmt.Errorf("replacing output file %s: %w", outputPath, err)
+	}
+	return nil
+}
+
+// validateExportOutput keeps atomic replacement from destroying collector inputs.
+func validateExportOutput(outputPath, dataDir, configPath string) error {
+	output, err := resolveParent(outputPath)
+	if err != nil {
+		return fmt.Errorf("resolving output path: %w", err)
+	}
+	dataPath, err := filepath.Abs(dataDir)
+	if err == nil {
+		dataPath, err = filepath.EvalSymlinks(dataPath)
+	}
+	if err != nil {
+		return fmt.Errorf("resolving data directory: %w", err)
+	}
+	isStorageFile := func(name string) bool {
+		for _, suffix := range []string{".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"} {
+			if strings.HasSuffix(name, suffix) {
+				_, err := time.Parse("2006-01-02", strings.TrimSuffix(name, suffix))
+				return err == nil
+			}
+		}
+		return false
+	}
+	protected := func(path string) bool {
+		return filepath.Dir(path) == dataPath && isStorageFile(filepath.Base(path))
+	}
+	if protected(output) {
+		return fmt.Errorf("refusing to overwrite collector storage file %s", outputPath)
+	}
+	outputInfo, err := os.Stat(output)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("checking output file: %w", err)
+	}
+	if outputInfo != nil {
+		entries, err := os.ReadDir(dataPath)
+		if err != nil {
+			return fmt.Errorf("checking storage files: %w", err)
+		}
+		for _, entry := range entries {
+			if !isStorageFile(entry.Name()) {
+				continue
+			}
+			info, err := os.Stat(filepath.Join(dataPath, entry.Name()))
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("checking storage file %s: %w", entry.Name(), err)
+			}
+			if os.SameFile(outputInfo, info) {
+				return fmt.Errorf("refusing to overwrite collector storage file %s", outputPath)
+			}
+		}
+	}
+	if configPath != "" {
+		info, err := os.Stat(configPath)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("checking configuration file: %w", err)
+		}
+		if info != nil && outputInfo != nil && os.SameFile(outputInfo, info) {
+			return fmt.Errorf("refusing to overwrite loaded configuration file %s", outputPath)
+		}
+	}
+	return nil
+}
+
+func resolveParent(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(abs)), nil
 }

@@ -4,14 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 
+	"github.com/mikispag/geojson-collector/internal/geo"
 	"github.com/mikispag/geojson-collector/internal/models"
 )
 
@@ -55,16 +60,37 @@ const (
 type Manager struct {
 	dataDir    string
 	readOnly   bool
-	mu         sync.RWMutex
+	mu         sync.Mutex
 	dbs        map[string]*sql.DB
 	lastAccess map[string]time.Time
 }
 
 // NewManager creates a new read-write storage Manager for the given data directory (used by daemon).
 func NewManager(dataDir string) (*Manager, error) {
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dataDir, 0755); err != nil {
-			return nil, fmt.Errorf("creating data directory %s: %w", dataDir, err)
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
+		return nil, fmt.Errorf("creating data directory %s: %w", dataDir, err)
+	}
+	if err := restrictPermissions(dataDir, 0750); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		name := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), "-wal"), "-shm")
+		if !strings.HasSuffix(name, ".sqlite") {
+			continue
+		}
+		if _, err := time.Parse("2006-01-02", strings.TrimSuffix(name, ".sqlite")); err != nil {
+			continue
+		}
+		if err := restrictPermissions(filepath.Join(dataDir, entry.Name()), 0640); err != nil {
+			return nil, err
 		}
 	}
 	return &Manager{
@@ -77,6 +103,17 @@ func NewManager(dataDir string) (*Manager, error) {
 
 // NewReadOnlyManager creates a read-only storage Manager for the given data directory (used by exporter).
 func NewReadOnlyManager(dataDir string) (*Manager, error) {
+	dataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("opening data directory %s: %w", dataDir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("data directory %s is not a directory", dataDir)
+	}
 	return &Manager{
 		dataDir:    dataDir,
 		readOnly:   true,
@@ -85,11 +122,27 @@ func NewReadOnlyManager(dataDir string) (*Manager, error) {
 	}, nil
 }
 
+// restrictPermissions tightens existing modes without granting new access.
+func restrictPermissions(path string, mode os.FileMode) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm() & ^mode == 0 {
+		return nil
+	}
+	if err := os.Chmod(path, info.Mode().Perm()&mode); err != nil {
+		return fmt.Errorf("restricting permissions for %s: %w", path, err)
+	}
+	return nil
+}
+
 // getDBForDate returns or opens the SQLite database for a specific UTC date (YYYY-MM-DD).
-// In read-only mode, it opens with mode=ro without executing WAL pragma or DDL.
-func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// The caller must hold m.mu for the entire operation using the returned handle.
+func (m *Manager) getDBForDate(ctx context.Context, dateStr string) (*sql.DB, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if db, ok := m.dbs[dateStr]; ok {
 		m.lastAccess[dateStr] = time.Now()
@@ -107,10 +160,9 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 			}
 		}
 		if oldestDB, exists := m.dbs[oldestKey]; exists {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_, _ = oldestDB.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
-			cancel()
-			_ = oldestDB.Close()
+			if err := oldestDB.Close(); err != nil {
+				return nil, err
+			}
 			delete(m.dbs, oldestKey)
 			delete(m.lastAccess, oldestKey)
 		} else {
@@ -120,40 +172,43 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 
 	dbPath := filepath.Join(m.dataDir, fmt.Sprintf("%s.sqlite", dateStr))
 
+	params := url.Values{}
+	params.Add("_pragma", "busy_timeout(5000)")
+	params.Add("_pragma", "synchronous(FULL)")
+	params.Add("_pragma", "foreign_keys(ON)")
+	params.Add("_pragma", "temp_store(MEMORY)")
 	if m.readOnly {
-		dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)", dbPath)
-		db, err := sql.Open("sqlite", dsn)
+		params.Set("mode", "ro")
+	} else {
+		// Precreate with private permissions so SQLite's WAL/SHM inherit them.
+		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0640)
 		if err != nil {
-			return nil, fmt.Errorf("opening read-only sqlite database %s: %w", dbPath, err)
+			return nil, err
 		}
-		m.dbs[dateStr] = db
-		m.lastAccess[dateStr] = time.Now()
-		return db, nil
+		if err := f.Close(); err != nil {
+			return nil, err
+		}
+		if err := restrictPermissions(dbPath, 0640); err != nil {
+			return nil, err
+		}
+		params.Add("_pragma", "journal_mode(WAL)")
 	}
-
-	// Open with pragmas configured for WAL mode and robust crash tolerance
-	// _pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)", dbPath)
+	dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: params.Encode()}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite database %s: %w", dbPath, err)
 	}
-
-	// Ensure WAL mode and table initialization
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode = WAL;"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("enabling WAL mode for %s: %w", dbPath, err)
-	}
-	if _, err := db.ExecContext(ctx, "PRAGMA synchronous = NORMAL;"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("setting synchronous=NORMAL for %s: %w", dbPath, err)
-	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("executing schema on %s: %w", dbPath, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if !m.readOnly {
+		if _, err := db.ExecContext(ctx, schema); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("executing schema on %s: %w", dbPath, err)
+		}
+		if err := repairLegacyTelemetry(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("repairing telemetry in %s: %w", dbPath, err)
+		}
 	}
 
 	m.dbs[dateStr] = db
@@ -161,20 +216,161 @@ func (m *Manager) getDBForDate(dateStr string) (*sql.DB, error) {
 	return db, nil
 }
 
-// InsertLocation inserts a LocationRecord into the SQLite database for its UTC date.
-func (m *Manager) InsertLocation(ctx context.Context, loc *models.LocationRecord) error {
-	if loc == nil {
-		return fmt.Errorf("nil location record")
+// repairLegacyTelemetry clears optional infinities accepted by older versions.
+func repairLegacyTelemetry(ctx context.Context, db *sql.DB) error {
+	var version int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return err
 	}
-	if m.readOnly {
-		return fmt.Errorf("cannot insert location into read-only manager")
+	if version >= 1 {
+		return nil
 	}
-
-	dateStr := loc.Timestamp.UTC().Format("2006-01-02")
-	db, err := m.getDBForDate(dateStr)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+UPDATE locations SET
+    altitude = CASE WHEN abs(altitude) > 1.7976931348623157e308 THEN NULL ELSE altitude END,
+    desired_accuracy = CASE WHEN abs(desired_accuracy) > 1.7976931348623157e308 THEN NULL ELSE desired_accuracy END,
+    deferred = CASE WHEN abs(deferred) > 1.7976931348623157e308 THEN NULL ELSE deferred END
+WHERE abs(altitude) > 1.7976931348623157e308
+   OR abs(desired_accuracy) > 1.7976931348623157e308
+   OR abs(deferred) > 1.7976931348623157e308;
+PRAGMA user_version = 1;`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// InsertLocation inserts a LocationRecord into the SQLite database for its UTC date.
+func (m *Manager) InsertLocation(ctx context.Context, loc *models.LocationRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.readOnly {
+		return fmt.Errorf("cannot insert location into read-only manager")
+	}
+	if err := validateRecord(loc); err != nil {
+		return err
+	}
+	db, err := m.getDBForDate(ctx, loc.Timestamp.UTC().Format("2006-01-02"))
+	if err != nil {
+		return err
+	}
+	return insertLocation(ctx, db, loc)
+}
+
+// InsertLocationIfUnique checks and inserts one point atomically.
+func (m *Manager) InsertLocationIfUnique(ctx context.Context, loc *models.LocationRecord, radiusMeters float64, interval time.Duration) (*geo.DuplicateMatch, error) {
+	matches, err := m.InsertLocationsIfUnique(ctx, []*models.LocationRecord{loc}, radiusMeters, interval)
+	if err != nil {
+		return nil, err
+	}
+	return matches[0], nil
+}
+
+// InsertLocationsIfUnique serializes deduplication and insertion across requests
+// sharing this manager. Each UTC day's accepted points commit in one transaction.
+// Matches correspond to input records; nil means the point was inserted. An error
+// can leave earlier days committed, so callers may retry the original batch.
+func (m *Manager) InsertLocationsIfUnique(ctx context.Context, locations []*models.LocationRecord, radiusMeters float64, interval time.Duration) ([]*geo.DuplicateMatch, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.readOnly {
+		return nil, fmt.Errorf("cannot insert location into read-only manager")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	matches := make([]*geo.DuplicateMatch, len(locations))
+	// Index staged records by device and time so unordered backfills only search
+	// their neighboring windows, instead of scanning the entire accepted batch.
+	type pendingKey struct {
+		device string
+		bucket int64
+	}
+	width := int64(interval)
+	if width <= 0 {
+		width = 1
+	}
+	accepted := make(map[pendingKey][]models.LocationRecord)
+	var days []string
+	groups := make(map[string][]*models.LocationRecord)
+	for i, loc := range locations {
+		if err := validateRecord(loc); err != nil {
+			return nil, err
+		}
+		var existing []models.LocationRecord
+		start, end := loc.Timestamp.Add(-interval), loc.Timestamp.Add(interval)
+		err := m.visitLocations(ctx, start, end, func(rec models.LocationRecord) error {
+			existing = append(existing, rec)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		match := geo.FindDuplicate(existing, loc, radiusMeters, interval)
+		device := geo.DeviceKey(loc)
+		if match == nil {
+			for bucket, last := start.UnixNano()/width, end.UnixNano()/width; bucket <= last; bucket++ {
+				match = geo.FindDuplicate(accepted[pendingKey{device, bucket}], loc, radiusMeters, interval)
+				if match != nil || bucket == last {
+					break
+				}
+			}
+		}
+		if match != nil {
+			matches[i] = match
+			continue
+		}
+		key := pendingKey{device, loc.Timestamp.UnixNano() / width}
+		accepted[key] = append(accepted[key], *loc)
+		day := loc.Timestamp.UTC().Format("2006-01-02")
+		if _, ok := groups[day]; !ok {
+			days = append(days, day)
+		}
+		groups[day] = append(groups[day], loc)
+	}
+	for _, day := range days {
+		db, err := m.getDBForDate(ctx, day)
+		if err != nil {
+			return nil, err
+		}
+		if err := insertDay(ctx, db, groups[day]); err != nil {
+			return nil, err
+		}
+	}
+	return matches, nil
+}
+
+func validateRecord(loc *models.LocationRecord) error {
+	if err := geo.ValidateFiniteNumbers(loc); err != nil {
+		return err
+	}
+	return validateTimestamp(loc.Timestamp)
+}
+
+func insertDay(ctx context.Context, db *sql.DB, locations []*models.LocationRecord) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, loc := range locations {
+		if err := insertLocation(ctx, tx, loc); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+type locationWriter interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func insertLocation(ctx context.Context, db locationWriter, loc *models.LocationRecord) error {
+	dateStr := loc.Timestamp.UTC().Format("2006-01-02")
 
 	var motionJSON sql.NullString
 	if len(loc.Motion) > 0 {
@@ -185,9 +381,11 @@ func (m *Manager) InsertLocation(ctx context.Context, loc *models.LocationRecord
 
 	var extraJSON sql.NullString
 	if len(loc.ExtraProperties) > 0 {
-		if b, err := json.Marshal(loc.ExtraProperties); err == nil {
-			extraJSON = sql.NullString{String: string(b), Valid: true}
+		b, err := json.Marshal(loc.ExtraProperties)
+		if err != nil {
+			return fmt.Errorf("serializing extra properties: %w", err)
 		}
+		extraJSON = sql.NullString{String: string(b), Valid: true}
 	}
 
 	var pausesVal sql.NullInt64
@@ -242,53 +440,70 @@ func (m *Manager) InsertLocation(ctx context.Context, loc *models.LocationRecord
 
 // GetLocationsInWindow queries all records within [start, end] across all relevant daily databases.
 func (m *Manager) GetLocationsInWindow(ctx context.Context, start, end time.Time) ([]models.LocationRecord, error) {
+	var records []models.LocationRecord
+	err := m.VisitLocationsInRange(ctx, start, end, func(rec models.LocationRecord) error {
+		records = append(records, rec)
+		return nil
+	})
+	return records, err
+}
+
+// VisitLocationsInRange visits records in timestamp order without retaining the
+// entire range. The callback must not call back into this manager.
+func (m *Manager) VisitLocationsInRange(ctx context.Context, start, end time.Time, visit func(models.LocationRecord) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.visitLocations(ctx, start, end, visit)
+}
+
+func validateTimestamp(ts time.Time) error {
+	if !time.Unix(0, ts.UnixNano()).Equal(ts) {
+		return fmt.Errorf("timestamp %v is outside SQLite nanosecond storage range", ts)
+	}
+	return nil
+}
+
+func (m *Manager) visitLocations(ctx context.Context, start, end time.Time, visit func(models.LocationRecord) error) error {
 	if start.After(end) {
 		start, end = end, start
 	}
-
-	startUTC := start.UTC()
-	endUTC := end.UTC()
-
-	var records []models.LocationRecord
-
-	// Iterate day by day from start to end
+	if err := validateTimestamp(start); err != nil {
+		return err
+	}
+	if err := validateTimestamp(end); err != nil {
+		return err
+	}
+	startUTC, endUTC := start.UTC(), end.UTC()
 	curr := time.Date(startUTC.Year(), startUTC.Month(), startUTC.Day(), 0, 0, 0, 0, time.UTC)
 	endDay := time.Date(endUTC.Year(), endUTC.Month(), endUTC.Day(), 0, 0, 0, 0, time.UTC)
-
-	startNano := startUTC.UnixNano()
-	endNano := endUTC.UnixNano()
-
 	for !curr.After(endDay) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		dateStr := curr.Format("2006-01-02")
-		dbPath := filepath.Join(m.dataDir, fmt.Sprintf("%s.sqlite", dateStr))
-
-		// Only check if file exists or if we already have it open
-		m.mu.RLock()
-		_, isLoaded := m.dbs[dateStr]
-		m.mu.RUnlock()
-
-		if !isLoaded {
+		dbPath := filepath.Join(m.dataDir, dateStr+".sqlite")
+		if _, isLoaded := m.dbs[dateStr]; !isLoaded {
 			if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 				curr = curr.AddDate(0, 0, 1)
 				continue
+			} else if err != nil {
+				return err
 			}
 		}
-
-		db, err := m.getDBForDate(dateStr)
+		db, err := m.getDBForDate(ctx, dateStr)
 		if err != nil {
-			return nil, err
+			return err
 		}
-
-		dayRecords, err := queryLocations(ctx, db, startNano, endNano)
-		if err != nil {
-			return nil, fmt.Errorf("querying locations from %s: %w", dateStr, err)
+		if err := queryLocations(ctx, db, startUTC.UnixNano(), endUTC.UnixNano(), visit); err != nil {
+			var sqliteErr *sqlite.Error
+			if m.readOnly && errors.As(err, &sqliteErr) && sqliteErr.Code()&255 == 8 {
+				return fmt.Errorf("querying locations from %s: WAL sidecars need directory write access when absent; run export as the service account that owns the data directory: %w", dateStr, err)
+			}
+			return fmt.Errorf("querying locations from %s: %w", dateStr, err)
 		}
-
-		records = append(records, dayRecords...)
 		curr = curr.AddDate(0, 0, 1)
 	}
-
-	return records, nil
+	return nil
 }
 
 // GetLocationsInRange is an alias for GetLocationsInWindow, returning sorted records.
@@ -296,7 +511,7 @@ func (m *Manager) GetLocationsInRange(ctx context.Context, start, end time.Time)
 	return m.GetLocationsInWindow(ctx, start, end)
 }
 
-func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) ([]models.LocationRecord, error) {
+func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64, visit func(models.LocationRecord) error) error {
 	query := `
 	SELECT
 		id, timestamp, timestamp_iso, latitude, longitude, altitude, speed, course,
@@ -311,11 +526,9 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) (
 
 	rows, err := db.QueryContext(ctx, query, startNano, endNano)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
-
-	var records []models.LocationRecord
 
 	for rows.Next() {
 		var (
@@ -346,7 +559,7 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) (
 			&locInPayload, &extraStr,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("scanning location row: %w", err)
+			return fmt.Errorf("scanning location row: %w", err)
 		}
 
 		var motion []string
@@ -356,7 +569,11 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) (
 
 		var extraProps map[string]interface{}
 		if extraStr.Valid && extraStr.String != "" {
-			_ = json.Unmarshal([]byte(extraStr.String), &extraProps)
+			decoder := json.NewDecoder(strings.NewReader(extraStr.String))
+			decoder.UseNumber()
+			if err := decoder.Decode(&extraProps); err != nil {
+				return fmt.Errorf("decoding extra properties for location %d: %w", id, err)
+			}
 		}
 
 		var pauses *bool
@@ -365,9 +582,15 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) (
 			pauses = &b
 		}
 
+		// Read-only exports also tolerate legacy optional infinities without changing disk.
+		for _, value := range []**float64{&alt, &desiredAcc, &defVal} {
+			if *value != nil && (math.IsNaN(**value) || math.IsInf(**value, 0)) {
+				*value = nil
+			}
+		}
 		ts := time.Unix(0, tsNano).UTC()
 
-		records = append(records, models.LocationRecord{
+		if err := visit(models.LocationRecord{
 			ID:                 id,
 			Timestamp:          ts,
 			TimestampISO:       tsISO,
@@ -393,14 +616,16 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64) (
 			SignificantChange:  sigChange,
 			LocationsInPayload: locInPayload,
 			ExtraProperties:    extraProps,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return err
 	}
 
-	return records, nil
+	return nil
 }
 
 // Close closes all open database connections.
@@ -410,11 +635,6 @@ func (m *Manager) Close() error {
 
 	var firstErr error
 	for dateStr, db := range m.dbs {
-		// Attempt a passive WAL checkpoint before closing to keep files clean
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, _ = db.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
-		cancel()
-
 		if err := db.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("closing database %s: %w", dateStr, err)
 		}

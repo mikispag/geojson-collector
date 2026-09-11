@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -72,6 +73,7 @@ func (d *Daemon) Run() error {
 	// Listen for shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigChan)
 
 	select {
 	case err := <-errChan:
@@ -83,13 +85,24 @@ func (d *Daemon) Run() error {
 	// Graceful shutdown with 10s timeout
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	return d.shutdown(shutdownCtx)
+}
 
-	if err := d.httpServer.Shutdown(shutdownCtx); err != nil {
+func (d *Daemon) shutdown(ctx context.Context) error {
+	err := d.httpServer.Shutdown(ctx)
+	if err != nil {
 		d.logger.Printf("[ERROR] HTTP server shutdown error: %v", err)
+		if closeErr := d.httpServer.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("closing HTTP server: %w", closeErr))
+		}
 	}
 
-	if err := d.storage.Close(); err != nil {
-		d.logger.Printf("[ERROR] closing storage databases: %v", err)
+	if closeErr := d.storage.Close(); closeErr != nil {
+		d.logger.Printf("[ERROR] closing storage databases: %v", closeErr)
+		err = errors.Join(err, fmt.Errorf("closing storage databases: %w", closeErr))
+	}
+	if err != nil {
+		return fmt.Errorf("shutdown: %w", err)
 	}
 
 	d.logger.Printf("Shutdown complete.")

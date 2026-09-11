@@ -2,11 +2,15 @@ package server_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -180,6 +184,118 @@ func TestServer_Deduplication(t *testing.T) {
 	}
 	if len(recs) != 1 {
 		t.Fatalf("expected 1 record (duplicate ignored), got %d", len(recs))
+	}
+}
+
+func TestServer_DeduplicationWithinPayload(t *testing.T) {
+	for _, hour := range []int{12, 23} {
+		t.Run(fmt.Sprintf("hour-%d", hour), func(t *testing.T) {
+			srv, mgr, _ := setupTestServer(t, "test-token")
+			defer mgr.Close()
+			handler := srv.Routes()
+			start := time.Date(2026, 8, 23, hour, 59, 50, 0, time.UTC)
+			var features []string
+			for _, offset := range []time.Duration{0, 20 * time.Second, 2 * time.Minute} {
+				features = append(features, fmt.Sprintf(`{"type":"Feature","geometry":{"type":"Point","coordinates":[8.5417,47.3769]},"properties":{"timestamp":%q,"device_id":"device-1"}}`,
+					start.Add(offset).Format(time.RFC3339)))
+			}
+			payload := `{"locations":[` + strings.Join(features, ",") + `]}`
+			// A retry must also deduplicate against the previously committed batch.
+			for range 2 {
+				req := httptest.NewRequest(http.MethodPost, "/api", bytes.NewBufferString(payload))
+				req.Header.Set("Authorization", "Bearer test-token")
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, req)
+				if w.Code != http.StatusOK {
+					t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+				}
+				records, err := mgr.GetLocationsInWindow(context.Background(), start, start.Add(2*time.Minute))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(records) != 2 {
+					t.Fatalf("expected two unique records from batch, got %d", len(records))
+				}
+				if !records[0].Timestamp.Equal(start) || !records[1].Timestamp.Equal(start.Add(2*time.Minute)) {
+					t.Errorf("unexpected accepted timestamps: %s, %s", records[0].Timestamp, records[1].Timestamp)
+				}
+			}
+		})
+	}
+}
+
+func TestServer_ConcurrentDeduplication(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		devices     int
+		start       time.Time
+		secondDelay time.Duration
+	}{
+		{
+			name:    "same device",
+			devices: 1,
+			start:   time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:    "different devices",
+			devices: 2,
+			start:   time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:        "across midnight",
+			devices:     1,
+			start:       time.Date(2026, 8, 23, 23, 59, 50, 0, time.UTC),
+			secondDelay: 20 * time.Second,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, mgr, _ := setupTestServer(t, "test-token")
+			defer mgr.Close()
+			handler := srv.Routes()
+
+			const requests = 32
+			start := make(chan struct{})
+			results := make(chan *httptest.ResponseRecorder, requests)
+			var ready sync.WaitGroup
+			ready.Add(requests)
+			for i := range requests {
+				timestamp := tc.start.Add(time.Duration(i%2) * tc.secondDelay)
+				payload := fmt.Sprintf(`{"locations":[{"type":"Feature","geometry":{"type":"Point","coordinates":[8.5417,47.3769]},"properties":{"timestamp":%q,"device_id":%q}}]}`,
+					timestamp.Format(time.RFC3339), fmt.Sprintf("device-%d", i%tc.devices))
+				go func() {
+					req := httptest.NewRequest(http.MethodPost, "/api", bytes.NewBufferString(payload))
+					req.Header.Set("Authorization", "Bearer test-token")
+					w := httptest.NewRecorder()
+					ready.Done()
+					<-start
+					handler.ServeHTTP(w, req)
+					results <- w
+				}()
+			}
+			ready.Wait()
+			close(start)
+			for range requests {
+				w := <-results
+				if w.Code != http.StatusOK {
+					t.Errorf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+				}
+			}
+
+			records, err := mgr.GetLocationsInWindow(context.Background(), tc.start.Add(-time.Minute), tc.start.Add(time.Minute))
+			if err != nil {
+				t.Fatalf("failed to query storage: %v", err)
+			}
+			if len(records) != tc.devices {
+				t.Fatalf("expected one record per device (%d total), got %d", tc.devices, len(records))
+			}
+			devices := make(map[string]bool)
+			for _, rec := range records {
+				devices[rec.DeviceID] = true
+			}
+			if len(devices) != tc.devices {
+				t.Errorf("expected %d distinct devices, got %v", tc.devices, devices)
+			}
+		})
 	}
 }
 

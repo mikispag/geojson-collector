@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"net"
 	"os"
 	"strconv"
 	"time"
@@ -53,6 +55,12 @@ func DefaultConfig() *Config {
 // LoadConfig loads configuration from a JSON file path if specified or present,
 // and applies environment variable overrides.
 func LoadConfig(configPath string) (*Config, error) {
+	return LoadConfigWithOverrides(configPath, nil)
+}
+
+// LoadConfigWithOverrides loads file and environment settings, applies CLI
+// overrides, then validates the resulting configuration.
+func LoadConfigWithOverrides(configPath string, override func(*Config)) (*Config, error) {
 	cfg := DefaultConfig()
 
 	explicit := true
@@ -82,9 +90,11 @@ func LoadConfig(configPath string) (*Config, error) {
 		cfg.Host = host
 	}
 	if portStr := os.Getenv("GEOJSON_COLLECTOR_PORT"); portStr != "" {
-		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
-			cfg.Port = p
+		p, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GEOJSON_COLLECTOR_PORT: %w", err)
 		}
+		cfg.Port = p
 	}
 	if token := os.Getenv("GEOJSON_COLLECTOR_AUTH_TOKEN"); token != "" {
 		cfg.AuthToken = token
@@ -93,18 +103,26 @@ func LoadConfig(configPath string) (*Config, error) {
 		cfg.DataDir = dataDir
 	}
 	if radStr := os.Getenv("GEOJSON_COLLECTOR_DEDUP_RADIUS"); radStr != "" {
-		if r, err := strconv.ParseFloat(radStr, 64); err == nil && r >= 0 {
-			cfg.DedupRadiusMeters = r
+		r, err := strconv.ParseFloat(radStr, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GEOJSON_COLLECTOR_DEDUP_RADIUS: %w", err)
 		}
+		cfg.DedupRadiusMeters = r
 	}
 	if intStr := os.Getenv("GEOJSON_COLLECTOR_DEDUP_INTERVAL"); intStr != "" {
-		if i, err := strconv.ParseFloat(intStr, 64); err == nil && i >= 0 {
-			cfg.DedupIntervalSeconds = i
+		i, err := strconv.ParseFloat(intStr, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GEOJSON_COLLECTOR_DEDUP_INTERVAL: %w", err)
 		}
+		cfg.DedupIntervalSeconds = i
+	}
+
+	if override != nil {
+		override(cfg)
 	}
 
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	return cfg, nil
@@ -118,11 +136,11 @@ func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		return fmt.Errorf("data_dir cannot be empty")
 	}
-	if c.DedupRadiusMeters < 0 {
-		return fmt.Errorf("dedup_radius_meters cannot be negative: %v", c.DedupRadiusMeters)
+	if math.IsNaN(c.DedupRadiusMeters) || math.IsInf(c.DedupRadiusMeters, 0) || c.DedupRadiusMeters < 0 {
+		return fmt.Errorf("dedup_radius_meters must be finite and nonnegative: %v", c.DedupRadiusMeters)
 	}
-	if c.DedupIntervalSeconds < 0 {
-		return fmt.Errorf("dedup_interval_seconds cannot be negative: %v", c.DedupIntervalSeconds)
+	if math.IsNaN(c.DedupIntervalSeconds) || math.IsInf(c.DedupIntervalSeconds, 0) || c.DedupIntervalSeconds < 0 {
+		return fmt.Errorf("dedup_interval_seconds must be finite and nonnegative: %v", c.DedupIntervalSeconds)
 	}
 	if c.DedupIntervalSeconds > 86400*365 {
 		return fmt.Errorf("dedup_interval_seconds exceeds maximum allowed (1 year): %v", c.DedupIntervalSeconds)
@@ -132,7 +150,7 @@ func (c *Config) Validate() error {
 
 // ListenAddr returns formatted host:port string for http.Server.
 func (c *Config) ListenAddr() string {
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
 // DedupInterval returns the deduplication time window as a time.Duration.
