@@ -27,3 +27,6 @@ bin/
 .vscode/
 *.swp
 *~
+
+# Local task notes
+/tasks/
