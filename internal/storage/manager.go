@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -160,6 +161,9 @@ func (m *Manager) getDBForDate(ctx context.Context, dateStr string) (*sql.DB, er
 			}
 		}
 		if oldestDB, exists := m.dbs[oldestKey]; exists {
+			if !m.readOnly {
+				checkpointDB(oldestDB)
+			}
 			if err := oldestDB.Close(); err != nil {
 				return nil, err
 			}
@@ -174,7 +178,7 @@ func (m *Manager) getDBForDate(ctx context.Context, dateStr string) (*sql.DB, er
 
 	params := url.Values{}
 	params.Add("_pragma", "busy_timeout(5000)")
-	params.Add("_pragma", "synchronous(FULL)")
+	params.Add("_pragma", "synchronous(NORMAL)")
 	params.Add("_pragma", "foreign_keys(ON)")
 	params.Add("_pragma", "temp_store(MEMORY)")
 	if m.readOnly {
@@ -284,6 +288,16 @@ func (m *Manager) InsertLocationsIfUnique(ctx context.Context, locations []*mode
 		return nil, err
 	}
 	matches := make([]*geo.DuplicateMatch, len(locations))
+	if len(locations) == 0 {
+		return matches, nil
+	}
+
+	for _, loc := range locations {
+		if err := validateRecord(loc); err != nil {
+			return nil, err
+		}
+	}
+
 	// Index staged records by device and time so unordered backfills only search
 	// their neighboring windows, instead of scanning the entire accepted batch.
 	type pendingKey struct {
@@ -294,24 +308,65 @@ func (m *Manager) InsertLocationsIfUnique(ctx context.Context, locations []*mode
 	if width <= 0 {
 		width = 1
 	}
-	accepted := make(map[pendingKey][]models.LocationRecord)
-	var days []string
-	groups := make(map[string][]*models.LocationRecord)
+
+	// Merge deduplication search windows across the batch to query SQLite once per contiguous interval.
+	type timeInterval struct {
+		start time.Time
+		end   time.Time
+	}
+	intervals := make([]timeInterval, len(locations))
 	for i, loc := range locations {
-		if err := validateRecord(loc); err != nil {
-			return nil, err
+		intervals[i] = timeInterval{
+			start: loc.Timestamp.Add(-interval),
+			end:   loc.Timestamp.Add(interval),
 		}
-		var existing []models.LocationRecord
-		start, end := loc.Timestamp.Add(-interval), loc.Timestamp.Add(interval)
-		err := m.visitLocations(ctx, start, end, func(rec models.LocationRecord) error {
-			existing = append(existing, rec)
+	}
+	sort.Slice(intervals, func(i, j int) bool {
+		return intervals[i].start.Before(intervals[j].start)
+	})
+	var merged []timeInterval
+	for _, iv := range intervals {
+		if len(merged) == 0 {
+			merged = append(merged, iv)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if !iv.start.After(last.end) {
+			if iv.end.After(last.end) {
+				last.end = iv.end
+			}
+		} else {
+			merged = append(merged, iv)
+		}
+	}
+
+	existingByBucket := make(map[pendingKey][]models.LocationRecord)
+	for _, iv := range merged {
+		err := m.visitLocations(ctx, iv.start, iv.end, func(rec models.LocationRecord) error {
+			dev := geo.DeviceKey(&rec)
+			b := rec.Timestamp.UnixNano() / width
+			key := pendingKey{dev, b}
+			existingByBucket[key] = append(existingByBucket[key], rec)
 			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
-		match := geo.FindDuplicate(existing, loc, radiusMeters, interval)
+	}
+
+	accepted := make(map[pendingKey][]models.LocationRecord)
+	var days []string
+	groups := make(map[string][]*models.LocationRecord)
+	for i, loc := range locations {
+		start, end := loc.Timestamp.Add(-interval), loc.Timestamp.Add(interval)
 		device := geo.DeviceKey(loc)
+		var match *geo.DuplicateMatch
+		for bucket, last := start.UnixNano()/width, end.UnixNano()/width; bucket <= last; bucket++ {
+			match = geo.FindDuplicate(existingByBucket[pendingKey{device, bucket}], loc, radiusMeters, interval)
+			if match != nil || bucket == last {
+				break
+			}
+		}
 		if match == nil {
 			for bucket, last := start.UnixNano()/width, end.UnixNano()/width; bucket <= last; bucket++ {
 				match = geo.FindDuplicate(accepted[pendingKey{device, bucket}], loc, radiusMeters, interval)
@@ -351,27 +406,22 @@ func validateRecord(loc *models.LocationRecord) error {
 	return validateTimestamp(loc.Timestamp)
 }
 
-func insertDay(ctx context.Context, db *sql.DB, locations []*models.LocationRecord) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, loc := range locations {
-		if err := insertLocation(ctx, tx, loc); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
+const insertLocationQuery = `
+INSERT INTO locations (
+	timestamp, timestamp_iso, latitude, longitude, altitude, speed, course,
+	horizontal_accuracy, vertical_accuracy, speed_accuracy, course_accuracy,
+	motion, battery_state, battery_level, wifi, device_id, unique_id,
+	pauses, activity, desired_accuracy, deferred, significant_change,
+	locations_in_payload, extra_properties
+) VALUES (
+	?, ?, ?, ?, ?, ?, ?,
+	?, ?, ?, ?,
+	?, ?, ?, ?, ?, ?,
+	?, ?, ?, ?, ?,
+	?, ?
+)`
 
-type locationWriter interface {
-	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
-}
-
-func insertLocation(ctx context.Context, db locationWriter, loc *models.LocationRecord) error {
-	dateStr := loc.Timestamp.UTC().Format("2006-01-02")
-
+func locationExecArgs(loc *models.LocationRecord) ([]interface{}, error) {
 	var motionJSON sql.NullString
 	if len(loc.Motion) > 0 {
 		if b, err := json.Marshal(loc.Motion); err == nil {
@@ -383,7 +433,7 @@ func insertLocation(ctx context.Context, db locationWriter, loc *models.Location
 	if len(loc.ExtraProperties) > 0 {
 		b, err := json.Marshal(loc.ExtraProperties)
 		if err != nil {
-			return fmt.Errorf("serializing extra properties: %w", err)
+			return nil, fmt.Errorf("serializing extra properties: %w", err)
 		}
 		extraJSON = sql.NullString{String: string(b), Valid: true}
 	}
@@ -404,37 +454,64 @@ func insertLocation(ctx context.Context, db locationWriter, loc *models.Location
 
 	tsUnixNano := loc.Timestamp.UTC().UnixNano()
 
-	query := `
-	INSERT INTO locations (
-		timestamp, timestamp_iso, latitude, longitude, altitude, speed, course,
-		horizontal_accuracy, vertical_accuracy, speed_accuracy, course_accuracy,
-		motion, battery_state, battery_level, wifi, device_id, unique_id,
-		pauses, activity, desired_accuracy, deferred, significant_change,
-		locations_in_payload, extra_properties
-	) VALUES (
-		?, ?, ?, ?, ?, ?, ?,
-		?, ?, ?, ?,
-		?, ?, ?, ?, ?, ?,
-		?, ?, ?, ?, ?,
-		?, ?
-	)`
-
-	res, err := db.ExecContext(ctx, query,
+	return []interface{}{
 		tsUnixNano, iso, loc.Latitude, loc.Longitude, loc.Altitude, loc.Speed, loc.Course,
 		loc.HorizontalAccuracy, loc.VerticalAccuracy, loc.SpeedAccuracy, loc.CourseAccuracy,
 		motionJSON, loc.BatteryState, loc.BatteryLevel, loc.WiFi, loc.DeviceID, loc.UniqueID,
 		pausesVal, loc.Activity, loc.DesiredAccuracy, loc.Deferred, loc.SignificantChange,
 		loc.LocationsInPayload, extraJSON,
-	)
+	}, nil
+}
+
+func insertDay(ctx context.Context, db *sql.DB, locations []*models.LocationRecord) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, insertLocationQuery)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, loc := range locations {
+		dateStr := loc.Timestamp.UTC().Format("2006-01-02")
+		args, err := locationExecArgs(loc)
+		if err != nil {
+			return err
+		}
+		res, err := stmt.ExecContext(ctx, args...)
+		if err != nil {
+			return fmt.Errorf("inserting location into %s.sqlite: %w", dateStr, err)
+		}
+		id, err := res.LastInsertId()
+		if err == nil {
+			loc.ID = id
+		}
+	}
+	return tx.Commit()
+}
+
+type locationWriter interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func insertLocation(ctx context.Context, db locationWriter, loc *models.LocationRecord) error {
+	dateStr := loc.Timestamp.UTC().Format("2006-01-02")
+	args, err := locationExecArgs(loc)
+	if err != nil {
+		return err
+	}
+	res, err := db.ExecContext(ctx, insertLocationQuery, args...)
 	if err != nil {
 		return fmt.Errorf("inserting location into %s.sqlite: %w", dateStr, err)
 	}
-
 	id, err := res.LastInsertId()
 	if err == nil {
 		loc.ID = id
 	}
-
 	return nil
 }
 
@@ -628,6 +705,12 @@ func queryLocations(ctx context.Context, db *sql.DB, startNano, endNano int64, v
 	return nil
 }
 
+func checkpointDB(db *sql.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+}
+
 // Close closes all open database connections.
 func (m *Manager) Close() error {
 	m.mu.Lock()
@@ -635,6 +718,9 @@ func (m *Manager) Close() error {
 
 	var firstErr error
 	for dateStr, db := range m.dbs {
+		if !m.readOnly {
+			checkpointDB(db)
+		}
 		if err := db.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("closing database %s: %w", dateStr, err)
 		}

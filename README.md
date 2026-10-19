@@ -14,7 +14,7 @@ A lightweight, robust, and zero-CGO Go daemon and CLI tool to collect real-time 
 
 * **Overland Webhook Server:** Collects batched location updates via HTTP `POST /api` with Bearer token authentication.
 * **Daily Partitioned Storage:** Automatically stores records into UTC daily SQLite databases (`/var/lib/geojson-collector/YYYY-MM-DD.sqlite`).
-* **Sudden Termination & Crash Resilience:** Runs SQLite with Write-Ahead Logging (`WAL`), `synchronous = FULL`, and `busy_timeout = 5000`. Each committed location is synced before acknowledgment, including across power loss when the filesystem and storage hardware honor sync requests.
+* **Sudden Termination & Crash Resilience:** Runs SQLite with Write-Ahead Logging (`WAL`), `synchronous = NORMAL`, and `busy_timeout = 5000`. Cleanly folds and truncates WAL sidecars on connection eviction and shutdown. Fully crash-resilient across sudden process termination or system reboots.
 * **Intelligent Deduplication:** Prevents duplicate stationary samples from the same device within a configurable radius (default `1.0m`) and time delta (default `60s`), including concurrent requests to the daemon and UTC midnight boundaries. Uses `unique_id` when available, otherwise `device_id`; unidentified devices share a separate group. Trip and action events are retained, with exact event retries deduplicated.
 * **Sanity & Telemetry Filtering:** Rejects corrupted GPS coordinates, unphysical speeds (e.g. supersonic glitches > Mach 3), clock-drift future timestamps, or malformed data while logging warnings to `stderr`.
 * **Timelinize-Ready RFC 7946 GeoJSON Exporter:** CLI `export` subcommand extracts time intervals into standard GeoJSON FeatureCollections, mapped with well-known keys (`velocity`, `heading`, `accuracy`, `altitude`, `timestamp`, `motion`, `battery_level`, `wifi`, etc.) directly consumable by the Timelinize GeoJSON importer.
@@ -269,13 +269,13 @@ CREATE INDEX IF NOT EXISTS idx_locations_coords ON locations(latitude, longitude
 On each opened connection, the daemon enforces:
 ```sql
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
+PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 PRAGMA temp_store = MEMORY;
 ```
 
-`FULL` syncs the WAL for each transaction before the server acknowledges the location. `NORMAL` would preserve database consistency after a power failure but could lose recently acknowledged commits. Power-failure durability depends on the filesystem and storage hardware honoring sync requests.
+In WAL mode, `NORMAL` guarantees database consistency across application crashes and power cuts while eliminating blocking disk sync bottlenecks on every transaction commit. When databases are evicted from the active cache or when the service shuts down, `PRAGMA wal_checkpoint(TRUNCATE)` is executed to cleanly merge WAL frames back into the main database file and truncate WAL sidecars.
 
 Accepted points in an upload commit in one transaction per UTC day. If a later day's transaction fails, earlier days may already be committed; retrying the upload deduplicates those points. The daemon caches at most two daily databases with one SQLite connection each.
 

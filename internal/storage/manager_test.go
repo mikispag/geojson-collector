@@ -46,8 +46,8 @@ func TestDatabaseSettingsAndPaths(t *testing.T) {
 				if err := db.QueryRow("PRAGMA synchronous").Scan(&synchronous); err != nil {
 					t.Fatal(err)
 				}
-				if synchronous != 2 {
-					t.Errorf("synchronous = %d, want FULL (2)", synchronous)
+				if synchronous != 1 {
+					t.Errorf("synchronous = %d, want NORMAL (1)", synchronous)
 				}
 			}
 			if err := m.Close(); err != nil {
